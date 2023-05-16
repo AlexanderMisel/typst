@@ -2,5 +2,6 @@
     "image": "mcr.microsoft.com/devcontainers/universal:2",
     "features": {
       "ghcr.io/devcontainers/features/rust:1": {}
-    }
+    },
+    "initializeCommand": "apt-get update && apt-get install -y mingw-w64"
   }
