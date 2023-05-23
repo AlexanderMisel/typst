@@ -5,6 +5,7 @@ mod context;
 mod counter;
 mod document;
 mod figure;
+mod footnote;
 mod heading;
 mod link;
 mod numbering;
@@ -18,6 +19,7 @@ pub use self::context::*;
 pub use self::counter::*;
 pub use self::document::*;
 pub use self::figure::*;
+pub use self::footnote::*;
 pub use self::heading::*;
 pub use self::link::*;
 pub use self::numbering::*;
@@ -27,6 +29,7 @@ pub use self::reference::*;
 pub use self::state::*;
 
 use crate::prelude::*;
+use crate::text::TextElem;
 
 /// Hook up all meta definitions.
 pub(super) fn define(global: &mut Scope) {
@@ -36,6 +39,7 @@ pub(super) fn define(global: &mut Scope) {
     global.define("outline", OutlineElem::func());
     global.define("heading", HeadingElem::func());
     global.define("figure", FigureElem::func());
+    global.define("footnote", FootnoteElem::func());
     global.define("cite", CiteElem::func());
     global.define("bibliography", BibliographyElem::func());
     global.define("locate", locate);
@@ -52,4 +56,9 @@ pub(super) fn define(global: &mut Scope) {
 pub trait LocalName {
     /// Get the name in the given language and (optionally) region.
     fn local_name(&self, lang: Lang, region: Option<Region>) -> &'static str;
+
+    /// Resolve the local name with a style chain.
+    fn local_name_in(&self, styles: StyleChain) -> &'static str {
+        self.local_name(TextElem::lang_in(styles), TextElem::region_in(styles))
+    }
 }
