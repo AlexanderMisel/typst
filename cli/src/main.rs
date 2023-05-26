@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use atty::Stream;
+use chrono::Datelike;
 use clap::Parser;
 use codespan_reporting::diagnostic::{Diagnostic, Label};
 use codespan_reporting::term::{self, termcolor};
@@ -22,14 +23,16 @@ use same_file::{is_same_file, Handle};
 use siphasher::sip128::{Hasher128, SipHasher13};
 use termcolor::{ColorChoice, StandardStream, WriteColor};
 use typst::diag::{FileError, FileResult, SourceError, StrResult};
-use typst::eval::Library;
+use typst::doc::Document;
+use typst::eval::{Datetime, Library};
 use typst::font::{Font, FontBook, FontInfo, FontVariant};
+use typst::geom::Color;
 use typst::syntax::{Source, SourceId};
 use typst::util::{Buffer, PathExt};
 use typst::World;
 use walkdir::WalkDir;
 
-use crate::args::{CliArguments, Command, CompileCommand};
+use crate::args::{CliArguments, Command, CompileCommand, DiagnosticFormat};
 
 type CodespanResult<T> = Result<T, CodespanError>;
 type CodespanError = codespan_reporting::files::Error;
@@ -105,10 +108,17 @@ struct CompileSettings {
 
     /// The open command to use.
     open: Option<Option<String>>,
+
+    /// The PPI to use for PNG export.
+    ppi: Option<f32>,
+
+    /// In which format to emit diagnostics
+    diagnostic_format: DiagnosticFormat,
 }
 
 impl CompileSettings {
     /// Create a new compile settings from the field values.
+    #[allow(clippy::too_many_arguments)]
     fn new(
         input: PathBuf,
         output: Option<PathBuf>,
@@ -116,12 +126,23 @@ impl CompileSettings {
         root: Option<PathBuf>,
         font_paths: Vec<PathBuf>,
         open: Option<Option<String>>,
+        ppi: Option<f32>,
+        diagnostic_format: DiagnosticFormat,
     ) -> Self {
         let output = match output {
             Some(path) => path,
             None => input.with_extension("pdf"),
         };
-        Self { input, output, watch, root, font_paths, open }
+        Self {
+            input,
+            output,
+            watch,
+            root,
+            font_paths,
+            open,
+            diagnostic_format,
+            ppi,
+        }
     }
 
     /// Create a new compile settings from the CLI arguments and a compile command.
@@ -130,12 +151,23 @@ impl CompileSettings {
     /// Panics if the command is not a compile or watch command.
     fn with_arguments(args: CliArguments) -> Self {
         let watch = matches!(args.command, Command::Watch(_));
-        let CompileCommand { input, output, open, .. } = match args.command {
-            Command::Compile(command) => command,
-            Command::Watch(command) => command,
-            _ => unreachable!(),
-        };
-        Self::new(input, output, watch, args.root, args.font_paths, open)
+        let CompileCommand { input, output, open, ppi, diagnostic_format, .. } =
+            match args.command {
+                Command::Compile(command) => command,
+                Command::Watch(command) => command,
+                _ => unreachable!(),
+            };
+
+        Self::new(
+            input,
+            output,
+            watch,
+            args.root,
+            args.font_paths,
+            open,
+            ppi,
+            diagnostic_format,
+        )
     }
 }
 
@@ -258,12 +290,10 @@ fn compile_once(world: &mut SystemWorld, command: &CompileSettings) -> StrResult
     world.main = world.resolve(&command.input).map_err(|err| err.to_string())?;
 
     match typst::compile(world) {
-        // Export the PDF.
+        // Export the PDF / PNG.
         Ok(document) => {
-            let buffer = typst::export::pdf(&document);
-            fs::write(&command.output, buffer).map_err(|_| "failed to write PDF file")?;
+            export(&document, command)?;
             status(command, Status::Success).unwrap();
-
             tracing::info!("Compilation succeeded");
             Ok(true)
         }
@@ -272,13 +302,49 @@ fn compile_once(world: &mut SystemWorld, command: &CompileSettings) -> StrResult
         Err(errors) => {
             set_failed();
             status(command, Status::Error).unwrap();
-            print_diagnostics(world, *errors)
+            print_diagnostics(world, *errors, command.diagnostic_format)
                 .map_err(|_| "failed to print diagnostics")?;
-
             tracing::info!("Compilation failed");
             Ok(false)
         }
     }
+}
+
+/// Export into the target format.
+fn export(document: &Document, command: &CompileSettings) -> StrResult<()> {
+    match command.output.extension() {
+        Some(ext) if ext.eq_ignore_ascii_case("png") => {
+            // Determine whether we have a `{n}` numbering.
+            let string = command.output.to_str().unwrap_or_default();
+            let numbered = string.contains("{n}");
+            if !numbered && document.pages.len() > 1 {
+                Err("cannot export multiple PNGs without `{n}` in output path")?;
+            }
+
+            // Find a number width that accomodates all pages. For instance, the
+            // first page should be numbered "001" if there are between 100 and
+            // 999 pages.
+            let width = 1 + document.pages.len().checked_ilog10().unwrap_or(0) as usize;
+            let ppi = command.ppi.unwrap_or(2.0);
+            let mut storage;
+
+            for (i, frame) in document.pages.iter().enumerate() {
+                let pixmap = typst::export::render(frame, ppi, Color::WHITE);
+                let path = if numbered {
+                    storage = string.replace("{n}", &format!("{:0width$}", i + 1));
+                    Path::new(&storage)
+                } else {
+                    command.output.as_path()
+                };
+                pixmap.save_png(path).map_err(|_| "failed to write PNG file")?;
+            }
+        }
+        _ => {
+            let buffer = typst::export::pdf(document);
+            fs::write(&command.output, buffer).map_err(|_| "failed to write PDF file")?;
+        }
+    }
+    Ok(())
 }
 
 /// Clear the terminal and render the status message.
@@ -357,9 +423,17 @@ impl Status {
 fn print_diagnostics(
     world: &SystemWorld,
     errors: Vec<SourceError>,
+    diagnostic_format: DiagnosticFormat,
 ) -> Result<(), codespan_reporting::files::Error> {
-    let mut w = StandardStream::stderr(ColorChoice::Auto);
-    let config = term::Config { tab_width: 2, ..Default::default() };
+    let mut w = match diagnostic_format {
+        DiagnosticFormat::Human => color_stream(),
+        DiagnosticFormat::Short => StandardStream::stderr(ColorChoice::Never),
+    };
+
+    let mut config = term::Config { tab_width: 2, ..Default::default() };
+    if diagnostic_format == DiagnosticFormat::Short {
+        config.display_style = term::DisplayStyle::Short;
+    }
 
     for error in errors {
         // The main diagnostic.
@@ -427,6 +501,7 @@ struct SystemWorld {
     hashes: RefCell<HashMap<PathBuf, FileResult<PathHash>>>,
     paths: RefCell<HashMap<PathHash, PathSlot>>,
     sources: FrozenVec<Box<Source>>,
+    current_date: Cell<Option<Datetime>>,
     main: SourceId,
 }
 
@@ -457,6 +532,7 @@ impl SystemWorld {
             hashes: RefCell::default(),
             paths: RefCell::default(),
             sources: FrozenVec::new(),
+            current_date: Cell::new(None),
             main: SourceId::detached(),
         }
     }
@@ -510,6 +586,23 @@ impl World for SystemWorld {
             .buffer
             .get_or_init(|| read(path).map(Buffer::from))
             .clone()
+    }
+
+    fn today(&self, offset: Option<i64>) -> Option<Datetime> {
+        if self.current_date.get().is_none() {
+            let datetime = match offset {
+                None => chrono::Local::now().naive_local(),
+                Some(o) => (chrono::Utc::now() + chrono::Duration::hours(o)).naive_utc(),
+            };
+
+            self.current_date.set(Some(Datetime::from_ymd(
+                datetime.year(),
+                datetime.month().try_into().ok()?,
+                datetime.day().try_into().ok()?,
+            )?))
+        }
+
+        self.current_date.get()
     }
 }
 
@@ -572,6 +665,7 @@ impl SystemWorld {
         self.sources.as_mut().clear();
         self.hashes.borrow_mut().clear();
         self.paths.borrow_mut().clear();
+        self.current_date.set(None);
     }
 }
 
